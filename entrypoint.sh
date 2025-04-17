@@ -18,6 +18,8 @@ echo "Current routes:"
 ip route list
 echo
 
+npm install superagent
+
 # Run specific test suite based on argument
 if [ "$1" = "--basic" ]; then
   echo "Running basic network-level tests only..."

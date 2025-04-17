@@ -7,6 +7,7 @@
 
 const net = require('net');
 const http = require('http');
+const superagent = require('superagent');
 
 // Configuration
 const TEST_IPS = {
@@ -281,47 +282,71 @@ function createProxyServer(options = {}) {
         return;
       }
       
-      const options = {
-        hostname: targetHost,
-        port: targetPort,
-        path: req.url,
-        method: req.method,
-        headers: req.headers,
-        timeout: 5000
-      };
-      
       // If simulating stale endpoint, connect to non-existent endpoint
-      if (simulateStaleEndpoint) {
-        console.log('  Proxy forwarding to stale endpoint (non-existent port)');
-        options.port = 65333; // Almost certainly unused port
+      const port = simulateStaleEndpoint ? 65333 : targetPort; // Almost certainly unused port
+      
+      console.log(`  Proxy forwarding to ${targetHost}:${port}`);
+      
+      // Use superagent to forward the request
+      const method = req.method.toLowerCase();
+      let proxyReq = superagent[method](`http://${targetHost}:${port}${req.url}`);
+      
+      // Copy headers from original request
+      Object.entries(req.headers).forEach(([key, value]) => {
+        proxyReq = proxyReq.set(key, value);
+      });
+      
+      // Handle request body for POST/PUT requests
+      if (['post', 'put', 'patch'].includes(method)) {
+        let body = [];
+        req.on('data', (chunk) => {
+          body.push(chunk);
+        });
+        
+        req.on('end', () => {
+          body = Buffer.concat(body);
+          
+          proxyReq
+            .send(body)
+            .timeout(5000)
+            .then(proxyRes => {
+              res.writeHead(proxyRes.status, proxyRes.headers);
+              res.end(proxyRes.text);
+            })
+            .catch(err => {
+              handleProxyError(err, res);
+            });
+        });
+      } else {
+        // For GET/DELETE/HEAD requests
+        proxyReq
+          .timeout(5000)
+          .then(proxyRes => {
+            res.writeHead(proxyRes.status, proxyRes.headers);
+            res.end(proxyRes.text);
+          })
+          .catch(err => {
+            handleProxyError(err, res);
+          });
       }
-      
-      console.log(`  Proxy forwarding to ${options.hostname}:${options.port}`);
-      
-      const proxyReq = http.request(options, (proxyRes) => {
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
-        proxyRes.pipe(res, { end: true });
-      });
-      
-      proxyReq.on('error', (err) => {
-        console.log(`  Proxy error: ${err.code} - ${err.message}`);
-        if (err.code === 'ECONNREFUSED') {
-          res.writeHead(502);
-          res.end('Connection Refused');
-        } else if (err.code === 'EHOSTUNREACH') {
-          res.writeHead(502);
-          res.end('Host Unreachable');
-        } else if (err.code === 'ETIMEDOUT') {
-          res.writeHead(504);
-          res.end('Gateway Timeout');
-        } else {
-          res.writeHead(500);
-          res.end(`Error: ${err.code}`);
-        }
-      });
-      
-      req.pipe(proxyReq, { end: true });
     });
+    
+    function handleProxyError(err, res) {
+      console.log(`  Proxy error: ${err.code || err.status} - ${err.message}`);
+      if (err.code === 'ECONNREFUSED') {
+        res.writeHead(502);
+        res.end('Connection Refused');
+      } else if (err.code === 'EHOSTUNREACH') {
+        res.writeHead(502);
+        res.end('Host Unreachable');
+      } else if (err.code === 'ETIMEDOUT' || err.timeout) {
+        res.writeHead(504);
+        res.end('Gateway Timeout');
+      } else {
+        res.writeHead(500);
+        res.end(`Error: ${err.code || err.status}`);
+      }
+    }
     
     proxyServer.listen(PROXY_PORT, () => {
       console.log(`  Proxy server listening on port ${PROXY_PORT}`);
@@ -352,46 +377,36 @@ async function setupNetworkPolicyScenario() {
   await createProxyServer({ targetHost: TEST_IPS.hostUnreach, forwardTraffic: true });
 }
 
-// Service call test for Kubernetes scenarios
+// Service call test for Kubernetes scenarios - refactored to use superagent
 async function testServiceCall() {
   sectionDivider('Making service call through proxy');
   
   return new Promise((resolve) => {
     console.log('  Making HTTP request to proxy...');
     
-    const req = http.request({
-      hostname: 'localhost',
-      port: PROXY_PORT,
-      path: '/',
-      method: 'GET',
-      timeout: 5000
-    }, (res) => {
-      console.log(`  Response status: ${res.statusCode}`);
-      let data = '';
-      
-      res.on('data', (chunk) => {
-        data += chunk;
-      });
-      
-      res.on('end', () => {
-        console.log(`  Response body: ${data}`);
+    superagent
+      .get(`http://localhost:${PROXY_PORT}/`)
+      .timeout(5000)
+      .then(res => {
+        console.log(`  Response status: ${res.status}`);
+        console.log(`  Response body: ${res.text}`);
+        resolve();
+      })
+      .catch(err => {
+        // Check for superagent error properties
+        const errorCode = err.code || (err.response ? err.response.status : 'unknown');
+        console.log(`  Request error: ${errorCode} - ${err.message}`);
+        
+        if (err.code === 'EHOSTUNREACH') {
+          console.log('  ✅ Successfully received EHOSTUNREACH error!');
+        } else if (err.code === 'ECONNREFUSED') {
+          console.log('  ❌ Received ECONNREFUSED error instead of EHOSTUNREACH');
+        } else if (err.code === 'ETIMEDOUT' || err.timeout) {
+          console.log('  ❌ Received timeout instead of EHOSTUNREACH');
+        }
+        
         resolve();
       });
-    });
-    
-    req.on('error', (err) => {
-      console.log(`  Request error: ${err.code} - ${err.message}`);
-      if (err.code === 'EHOSTUNREACH') {
-        console.log('  ✅ Successfully received EHOSTUNREACH error!');
-      } else if (err.code === 'ECONNREFUSED') {
-        console.log('  ❌ Received ECONNREFUSED error instead of EHOSTUNREACH');
-      } else if (err.code === 'ETIMEDOUT') {
-        console.log('  ❌ Received timeout instead of EHOSTUNREACH');
-      }
-      resolve();
-    });
-    
-    req.end();
   });
 }
 
