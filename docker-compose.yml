@@ -1,0 +1,8 @@
+services:
+  ehostunreach-test:
+    build:
+      context: ..
+      dockerfile: ./network-errors/Dockerfile
+    cap_add:
+      - NET_ADMIN
+    container_name: ehostunreach-test
